@@ -244,98 +244,96 @@ function normalizeRetellPayload(body: any): NormalizedLead {
   };
 }
 
-// ---------- LLM enrichment ----------
-
 async function enrichLeadWithLLM(params: {
-  summary: string;
-  transcript: string;
-}): Promise<LLMExtractionResult | null> {
-  if (!openai) {
-    console.warn("OPENAI_API_KEY not configured, skipping enrichment");
-    return null;
-  }
-
-  const { summary, transcript } = params;
-
-  const prompt = `
-You are a data extraction engine for a real estate CRM.
-Given a call summary and transcript, extract the following fields if present.
-If a field is unknown, set it to null.
-
-Return ONLY valid JSON with this exact shape:
-
-{
-  "first_name": string | null,
-  "last_name": string | null,
-  "email": string | null,
-  "location": string | null,
-  "budget_min": number | null,
-  "budget_max": number | null
-}
-
-Rules:
-- "location" can be a city, neighborhood, or area name (e.g. "Arlington, VA" or "Manassas").
-- If buyer mentions budget like "around 500k" or "400 to 600 thousand", convert to budget_min / budget_max in dollars.
-- If only one budget number is mentioned, set both budget_min and budget_max to that number.
-- Do not include any text outside the JSON object.
-- Use numbers for budget values, no currency symbols.
-
-Call summary:
-${summary || "(none)"}
-
-Transcript:
-${transcript || "(none)"}
-`.trim();
-
-  try {
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You extract structured data for a real estate CRM. Respond with ONLY a single JSON object, no commentary.",
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      temperature: 0,
-    });
-
-    const content = resp.choices[0]?.message?.content;
-    if (!content) {
-      console.error("No content from LLM enrichment");
+    summary: string;
+    transcript: string;
+  }): Promise<LLMExtractionResult | null> {
+    if (!openai) {
+      console.warn("OPENAI_API_KEY not configured, skipping enrichment");
       return null;
     }
-
-    // content should be JSON
-    let parsed: any;
+  
+    const { summary, transcript } = params;
+  
+    const prompt = `
+  You are a data extraction engine for a real estate CRM.
+  Given a call summary and transcript, extract the following fields if present.
+  If a field is unknown, set it to null.
+  
+  Return ONLY valid JSON with this exact shape:
+  
+  {
+    "first_name": string | null,
+    "last_name": string | null,
+    "email": string | null,
+    "location": string | null,
+    "budget_min": number | null,
+    "budget_max": number | null
+  }
+  
+  Rules:
+  - "location" can be a city, neighborhood, or area name (e.g. "Arlington, VA" or "Manassas").
+  - If buyer mentions budget like "around 500k" or "400 to 600 thousand", convert to budget_min / budget_max in dollars.
+  - If only one budget number is mentioned, set both budget_min and budget_max to that number.
+  - Do not include any text outside the JSON object.
+  - Use numbers for budget values, no currency symbols.
+  
+  Call summary:
+  ${summary || "(none)"}
+  
+  Transcript:
+  ${transcript || "(none)"}
+  `.trim();
+  
     try {
-      parsed = JSON.parse(content);
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "You extract structured data for a real estate CRM. Respond with ONLY a single JSON object, valid JSON.",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        temperature: 0,
+      });
+  
+      const content = resp.choices[0]?.message?.content;
+      if (!content) {
+        console.error("No content from LLM enrichment");
+        return null;
+      }
+  
+      let parsed: any;
+      try {
+        parsed = JSON.parse(content);
+      } catch (err) {
+        console.error("Failed to parse LLM JSON:", err, "raw:", content);
+        return null;
+      }
+  
+      const result: LLMExtractionResult = {
+        first_name: parsed.first_name ?? null,
+        last_name: parsed.last_name ?? null,
+        email: parsed.email ?? null,
+        location: parsed.location ?? null,
+        budget_min:
+          typeof parsed.budget_min === "number" ? parsed.budget_min : null,
+        budget_max:
+          typeof parsed.budget_max === "number" ? parsed.budget_max : null,
+      };
+  
+      return result;
     } catch (err) {
-      console.error("Failed to parse LLM JSON:", err, "raw:", content);
+      console.error("LLM enrichment error:", err);
       return null;
     }
-
-    const result: LLMExtractionResult = {
-      first_name: parsed.first_name ?? null,
-      last_name: parsed.last_name ?? null,
-      email: parsed.email ?? null,
-      location: parsed.location ?? null,
-      budget_min:
-        typeof parsed.budget_min === "number" ? parsed.budget_min : null,
-      budget_max:
-        typeof parsed.budget_max === "number" ? parsed.budget_max : null,
-    };
-
-    return result;
-  } catch (err) {
-    console.error("LLM enrichment error:", err);
-    return null;
   }
-}
 
 // ---------- Handlers ----------
 
