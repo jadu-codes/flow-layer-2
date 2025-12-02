@@ -1,7 +1,16 @@
+// app/api/intake/phone-call/route.ts
+
 import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
 const INTAKE_SECRET = process.env.INTAKE_SECRET;
+
+// ---------- Types ----------
+
+type RetellWebhookBody = {
+  event: string;
+  call?: any;
+};
 
 type NormalizedLead = {
   agent_id: string | null;
@@ -21,11 +30,14 @@ type NormalizedLead = {
   ai_notes: string | null;
 };
 
-function normalizeRetellPayload(body: any): NormalizedLead {
+// ---------- Normalizer (Retell → Lead) ----------
+
+function normalizeRetellPayload(body: RetellWebhookBody): NormalizedLead {
   const call = body.call ?? {};
   const analysis = call.call_analysis ?? {};
-  const summaryJsonRaw =
-    analysis.custom_analysis_data?.summary_json ?? null;
+
+  // Retell custom JSON summary (if configured)
+  const summaryJsonRaw = analysis.custom_analysis_data?.summary_json ?? null;
 
   let summaryJson: any = {};
   if (summaryJsonRaw && typeof summaryJsonRaw === "string") {
@@ -44,16 +56,21 @@ function normalizeRetellPayload(body: any): NormalizedLead {
 
   const transcript: string = call.transcript ?? "";
 
-  // Simple buyer/seller heuristic
+  // ---------- Buyer / Seller heuristic ----------
   const textForIntent = (callSummary ?? "") + " " + transcript;
   let buyerSeller: string | null = null;
-  if (/buy|purchase|looking to purchase|looking to buy/i.test(textForIntent)) {
+
+  if (
+    /buy|purchase|looking to purchase|looking to buy|buyer/i.test(textForIntent)
+  ) {
     buyerSeller = "buyer";
-  } else if (/sell|listing|list my home|sell my house/i.test(textForIntent)) {
+  } else if (
+    /sell|listing|list my home|sell my house|seller/i.test(textForIntent)
+  ) {
     buyerSeller = "seller";
   }
 
-  // Basic scoring heuristics
+  // ---------- Scoring heuristics ----------
   const userSentiment: string | null =
     summaryJson.user_sentiment ?? analysis.user_sentiment ?? null;
   const callSuccessful: boolean =
@@ -63,37 +80,39 @@ function normalizeRetellPayload(body: any): NormalizedLead {
   let intentScore = 50;
   let urgency: string | null = "medium";
 
-  // Boost if successful and clear intent
+  // If Retell said the call was "successful", boost scores
   if (callSuccessful) {
     priorityScore += 30;
     intentScore += 20;
   }
 
+  // Clear purchase intent
   if (/purchase a house|buy a house|buy a home/i.test(textForIntent)) {
     intentScore += 10;
   }
 
+  // Sentiment weighting
   if (userSentiment === "Positive") {
     priorityScore += 10;
   } else if (userSentiment === "Negative") {
     priorityScore -= 10;
   }
 
-  // Clamp scores
+  // Clamp scores 0–100
   priorityScore = Math.max(0, Math.min(100, priorityScore));
   intentScore = Math.max(0, Math.min(100, intentScore));
 
   return {
     agent_id: call.agent_id ?? null,
-    first_name: null, // not captured yet in this call
+    first_name: null, // name capture not wired yet
     last_name: null,
-    phone: call.from_number ?? null, // caller = lead phone
-    email: null, // not provided in this example
+    phone: call.from_number ?? null, // inbound caller
+    email: null, // no email in this payload yet
     source: "AI Phone Call",
     priority_score: priorityScore,
     intent_score: intentScore,
     buyer_seller: buyerSeller,
-    timeline: null, // no timeframe mentioned in this call
+    timeline: null, // timeframe not extracted yet
     status: "new",
     intent: callSummary,
     urgency,
@@ -102,22 +121,33 @@ function normalizeRetellPayload(body: any): NormalizedLead {
   };
 }
 
+// ---------- Handlers ----------
+
 export async function GET() {
   return NextResponse.json({ status: "ok", method: "GET" });
 }
 
 export async function POST(req: Request) {
   try {
-    // TEMP: only block if someone sends a wrong secret.
-    // If there is no header, we let it through (for Retell).
+    // If a header is sent AND a secret is configured, enforce it.
+    // If no header is present, let it through (Retell can't set headers easily).
     const header = req.headers.get("x-intake-secret");
     if (header && INTAKE_SECRET && header !== INTAKE_SECRET) {
       console.warn("Intake request with wrong secret");
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const body = await req.json();
+    const body = (await req.json()) as RetellWebhookBody;
     console.log("📞 Incoming phone call payload:", body);
+
+    // We only want to create leads on the final analyzed event.
+    if (body.event !== "call_analyzed") {
+      console.log("Ignoring non-analyzed event:", body.event);
+      return NextResponse.json({
+        status: "ignored",
+        event: body.event,
+      });
+    }
 
     const norm = normalizeRetellPayload(body);
     const nowIso = new Date().toISOString();
