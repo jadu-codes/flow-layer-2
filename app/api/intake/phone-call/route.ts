@@ -24,36 +24,34 @@ type NormalizedLead = {
 // ---- Heuristics helpers -------------------------------------
 
 function extractBuyerSeller(text: string): string | null {
-  const lower = text.toLowerCase();
-
-  const buyerPatterns = [
-    "buy a house",
-    "buy a home",
-    "buying a house",
-    "buying a home",
-    "looking to buy",
-    "looking to purchase",
-    "purchase a house",
-    "purchase a home",
-    "buyer consultation",
-  ];
-
-  const sellerPatterns = [
-    "sell my house",
-    "sell my home",
-    "selling my house",
-    "selling my home",
-    "list my home",
-    "listing appointment",
-    "home value",
-    "what is my house worth",
-  ];
-
-  if (buyerPatterns.some((p) => lower.includes(p))) return "buyer";
-  if (sellerPatterns.some((p) => lower.includes(p))) return "seller";
-
-  return null;
-}
+    const lower = text.toLowerCase();
+  
+    const hasPropertyWord = /(house|home|property|condo|apartment|place|townhome|townhouse)/.test(
+      lower
+    );
+  
+    // Buyer intent
+    if (
+      hasPropertyWord &&
+      /(buy|purchase|looking to buy|looking to purchase|shopping for|interested in buying)/.test(
+        lower
+      )
+    ) {
+      return "buyer";
+    }
+  
+    // Seller intent
+    if (
+      hasPropertyWord &&
+      /(sell|selling|list|listing|get it listed|put.*on the market|put my .* on the market)/.test(
+        lower
+      )
+    ) {
+      return "seller";
+    }
+  
+    return null;
+  }
 
 function extractTimeline(text: string): { timeline: string | null; urgency: string | null } {
   const lower = text.toLowerCase();
