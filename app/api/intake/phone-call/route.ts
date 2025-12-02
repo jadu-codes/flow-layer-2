@@ -3,10 +3,9 @@ import { supabaseServer } from "@/lib/supabaseServer";
 
 const INTAKE_SECRET = process.env.INTAKE_SECRET;
 
-// Very simple normalizer for now. Later you'll plug in real Retell fields.
+// Very simple normalizer for now.
 function normalizeLeadPayload(body: any) {
   const lead = body.lead ?? body;
-
   const summary = lead.summary ?? {};
   const meta = lead.meta ?? {};
 
@@ -35,22 +34,20 @@ export async function GET() {
 
 export async function POST(req: Request) {
   try {
-    // 1) Auth check
-    const secretHeader = req.headers.get("x-intake-secret");
-    if (!INTAKE_SECRET || !secretHeader || secretHeader !== INTAKE_SECRET) {
-      console.warn("Unauthorized intake attempt");
+    // 🔓 TEMPORARY: only block if someone sends a *wrong* secret.
+    // If there is no header, we let it through (for Retell).
+    const header = req.headers.get("x-intake-secret");
+    if (header && INTAKE_SECRET && header !== INTAKE_SECRET) {
+      console.warn("Intake request with wrong secret");
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // 2) Parse body
     const body = await req.json();
     console.log("📞 Incoming phone call payload:", body);
 
-    // 3) Normalize into your lead schema
     const norm = normalizeLeadPayload(body);
     const nowIso = new Date().toISOString();
 
-    // 4) Insert into Supabase
     const { data, error } = await supabaseServer
       .from("leads")
       .insert({
@@ -75,7 +72,7 @@ export async function POST(req: Request) {
             type: "created",
             at: nowIso,
             source: norm.source,
-            raw: body, // store raw payload for debugging
+            raw: body, // full Retell payload for debugging
           },
         ],
       })
