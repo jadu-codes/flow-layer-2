@@ -1,17 +1,8 @@
 // app/api/intake/phone-call/route.ts
-
 import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
-import OpenAI from "openai";
 
 const INTAKE_SECRET = process.env.INTAKE_SECRET;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
-const openai = OPENAI_API_KEY
-  ? new OpenAI({ apiKey: OPENAI_API_KEY })
-  : null;
-
-// ---------- Types ----------
 
 type NormalizedLead = {
   agent_id: string | null;
@@ -22,320 +13,200 @@ type NormalizedLead = {
   source: string;
   priority_score: number | null;
   intent_score: number | null;
-  buyer_seller: string | null; // "buyer" | "seller" | null
-  timeline: string | null; // "asap", "0-3 months", etc.
+  buyer_seller: string | null; // "buyer" | "seller" | "renter" | null
+  timeline: string | null;
   status: string;
   intent: string | null;
-  urgency: string | null; // "high" | "medium" | "low" | null
+  urgency: string | null; // "low" | "medium" | "high" | null
   priority: string | null;
   ai_notes: string | null;
 };
 
-type LLMExtractionResult = {
+// ---------- small helpers ----------
+
+function clamp(num: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, num));
+}
+
+function splitName(fullName: string | null): {
   first_name: string | null;
   last_name: string | null;
-  email: string | null;
-  location: string | null;
-  budget_min: number | null;
-  budget_max: number | null;
-};
+} {
+  if (!fullName || typeof fullName !== "string") {
+    return { first_name: null, last_name: null };
+  }
+  const parts = fullName.trim().split(/\s+/);
+  if (parts.length === 1) {
+    return { first_name: parts[0], last_name: null };
+  }
+  const first_name = parts[0];
+  const last_name = parts.slice(1).join(" ");
+  return { first_name, last_name };
+}
 
-// ---------- Heuristic helpers (buyer/seller, timeline, scoring) ----------
-
-function extractBuyerSeller(text: string): string | null {
+function inferBuyerSeller(text: string): string | null {
   const lower = text.toLowerCase();
-
-  const hasPropertyWord =
-    /(house|home|property|condo|apartment|place|townhome|townhouse)/.test(
-      lower
-    );
-
-  // Buyer intent
-  if (
-    hasPropertyWord &&
-    /(buy|purchase|looking to buy|looking to purchase|shopping for|interested in buying)/.test(
-      lower
-    )
-  ) {
+  if (/(buy|purchase|looking to buy|looking to purchase)/i.test(lower)) {
     return "buyer";
   }
-
-  // Seller intent
-  if (
-    hasPropertyWord &&
-    /(sell|selling|list|listing|get it listed|put.*on the market|put my .* on the market)/.test(
-      lower
-    )
-  ) {
+  if (/(sell|listing|list my (home|house))/i.test(lower)) {
     return "seller";
   }
-
+  if (/(rent|rental|lease)/i.test(lower)) {
+    return "renter";
+  }
   return null;
 }
 
-function extractTimeline(
-  text: string
-): { timeline: string | null; urgency: string | null } {
-  const lower = text.toLowerCase();
+function inferUrgency(timeframe: string | null): string | null {
+  if (!timeframe) return null;
+  const tf = timeframe.toLowerCase();
 
-  // ASAP / very soon
-  if (
-    /asap|as soon as possible|right away|immediately|this week|next week/.test(
-      lower
-    )
-  ) {
-    return { timeline: "ASAP", urgency: "high" };
+  if (/(today|tonight|tomorrow|this week|asap|immediately)/.test(tf)) {
+    return "high";
   }
-
-  // This month / next couple of months
-  if (
-    /this month|next month|within a couple of months|within a few months|in the next few months/.test(
-      lower
-    )
-  ) {
-    return { timeline: "0-3 months", urgency: "high" };
+  if (/(next month|1-2 months|one to two months)/.test(tf)) {
+    return "high";
   }
-
-  // 3-6 months window
-  if (
-    /in 3 months|in three months|in 4 months|in four months|in 5 months|in five months|in 6 months|in six months|this summer|this fall|later this year/.test(
-      lower
-    )
-  ) {
-    return { timeline: "3-6 months", urgency: "medium" };
+  if (/(next three to six months|3-6 months|few months)/.test(tf)) {
+    return "medium";
   }
-
-  // 6-12 months / next year
-  if (
-    /next year|in a year|in 9 months|in nine months|in 10 months|in ten months|in 11 months|in eleven months/.test(
-      lower
-    )
-  ) {
-    return { timeline: "6-12 months", urgency: "low" };
+  if (/(next year|12 months|a year|long term)/.test(tf)) {
+    return "low";
   }
-
-  // Default
-  return { timeline: null, urgency: "medium" };
+  // default
+  return "medium";
 }
 
-function scoreLead(opts: {
-  buyer_seller: string | null;
-  timeline: string | null;
-  userSentiment: string | null;
-  callSuccessful: boolean;
-  text: string;
-}): { priority_score: number; intent_score: number; urgency: string | null } {
-  let priority = 40;
-  let intent = 50;
+// ---------- Retell-specific normalizer ----------
 
-  // Base urgency from timeline
-  let urgency: string | null = "medium";
-  if (opts.timeline === "ASAP" || opts.timeline === "0-3 months") urgency = "high";
-  if (opts.timeline === "6-12 months") urgency = "low";
-
-  // Buyer / seller identified = stronger intent
-  if (opts.buyer_seller) {
-    intent += 15;
-    priority += 10;
-  }
-
-  // Timeframe closer → higher scores
-  if (opts.timeline === "ASAP") {
-    priority += 25;
-    intent += 20;
-  } else if (opts.timeline === "0-3 months") {
-    priority += 15;
-    intent += 15;
-  } else if (opts.timeline === "3-6 months") {
-    priority += 8;
-    intent += 10;
-  } else if (opts.timeline === "6-12 months") {
-    priority -= 5;
-    intent -= 5;
-  }
-
-  // Clear buying intent phrases
-  if (
-    /buy a house|buy a home|purchase a house|purchase a home|ready to move/i.test(
-      opts.text
-    )
-  ) {
-    intent += 10;
-  }
-
-  // Sentiment
-  if (opts.userSentiment === "Positive") {
-    priority += 10;
-  } else if (opts.userSentiment === "Negative") {
-    priority -= 10;
-  }
-
-  // Call considered successful by Retell
-  if (opts.callSuccessful) {
-    priority += 10;
-    intent += 10;
-  }
-
-  // Clamp 0-100
-  priority = Math.max(0, Math.min(100, priority));
-  intent = Math.max(0, Math.min(100, intent));
-
-  return { priority_score: priority, intent_score: intent, urgency };
-}
-
-// ---------- Retell normalizer ----------
-
-function normalizeRetellPayload(body: any): NormalizedLead {
+function normalizeRetellCallAnalyzed(body: any): NormalizedLead {
   const call = body.call ?? {};
   const analysis = call.call_analysis ?? {};
-  const summaryJsonRaw =
-    analysis.custom_analysis_data?.summary_json ?? null;
+  const custom = analysis.custom_analysis_data ?? {};
 
+  // summary_json is a STRING containing JSON
   let summaryJson: any = {};
-  if (summaryJsonRaw && typeof summaryJsonRaw === "string") {
+  if (typeof custom.summary_json === "string") {
     try {
-      summaryJson = JSON.parse(summaryJsonRaw);
-    } catch (e) {
-      console.error("Failed to parse summary_json:", e);
+      summaryJson = JSON.parse(custom.summary_json);
+    } catch (err) {
+      console.error("Failed to parse summary_json:", err);
     }
   }
 
   const callSummary: string | null =
-    summaryJson.call_summary ??
-    analysis.call_summary ??
-    call.transcript ??
-    null;
+    analysis.call_summary ?? call.transcript ?? null;
+
+  const interest: string | null = summaryJson.interest ?? null;
+  const timeframe: string | null = summaryJson.timeframe ?? null;
+  const budget: string | null = summaryJson.budget ?? null;
+  const email: string | null = summaryJson.email ?? null;
+  const phoneFromSummary: string | null =
+    summaryJson.phone_number ?? null;
+
+  const name: string | null = summaryJson.name ?? null;
+  const { first_name, last_name } = splitName(name);
 
   const transcript: string = call.transcript ?? "";
-  const combinedText = `${callSummary ?? ""}\n${transcript}`;
 
-  const buyer_seller = extractBuyerSeller(combinedText);
-  const { timeline, urgency: timelineUrgency } = extractTimeline(combinedText);
+  const intentTextSource =
+    [interest, callSummary, transcript].filter(Boolean).join(" ") || "";
+
+  const buyer_seller = inferBuyerSeller(intentTextSource);
+  const urgency = inferUrgency(timeframe);
 
   const userSentiment: string | null =
     summaryJson.user_sentiment ?? analysis.user_sentiment ?? null;
   const callSuccessful: boolean =
     summaryJson.call_successful ?? analysis.call_successful ?? false;
 
-  const { priority_score, intent_score, urgency } = scoreLead({
-    buyer_seller,
-    timeline,
-    userSentiment,
-    callSuccessful,
-    text: combinedText,
-  });
+  // basic scoring with some boosts
+  let priority_score = 50;
+  let intent_score = 60;
+
+  if (buyer_seller) intent_score += 10;
+  if (timeframe) {
+    priority_score += 10;
+    intent_score += 10;
+  }
+  if (budget) {
+    priority_score += 5;
+    intent_score += 5;
+  }
+
+  if (userSentiment === "Positive") priority_score += 10;
+  if (userSentiment === "Negative") priority_score -= 10;
+
+  if (callSuccessful) {
+    priority_score += 10;
+    intent_score += 10;
+  }
+
+  priority_score = clamp(priority_score, 0, 100);
+  intent_score = clamp(intent_score, 0, 100);
+
+  const aiNotesParts: string[] = [];
+  if (callSummary) aiNotesParts.push(callSummary);
+  if (budget) aiNotesParts.push(`Budget: ${budget}`);
+  if (timeframe) aiNotesParts.push(`Timeframe: ${timeframe}`);
+  const ai_notes = aiNotesParts.length ? aiNotesParts.join(" | ") : null;
 
   return {
     agent_id: call.agent_id ?? null,
-    first_name: null, // will be filled by LLM later if possible
-    last_name: null,
-    phone: call.from_number ?? null,
-    email: null,
+    first_name,
+    last_name,
+    phone: phoneFromSummary ?? call.from_number ?? null,
+    email: email ?? null,
     source: "AI Phone Call",
     priority_score,
     intent_score,
     buyer_seller,
-    timeline,
+    timeline: timeframe,
     status: "new",
-    intent: callSummary,
-    urgency: urgency ?? timelineUrgency,
+    intent: interest ?? callSummary,
+    urgency,
     priority: null,
-    ai_notes: callSummary,
+    ai_notes,
   };
 }
 
-async function enrichLeadWithLLM(params: {
-    summary: string;
-    transcript: string;
-  }): Promise<LLMExtractionResult | null> {
-    if (!openai) {
-      console.warn("OPENAI_API_KEY not configured, skipping enrichment");
-      return null;
-    }
-  
-    const { summary, transcript } = params;
-  
-    const prompt = `
-  You are a data extraction engine for a real estate CRM.
-  Given a call summary and transcript, extract the following fields if present.
-  If a field is unknown, set it to null.
-  
-  Return ONLY valid JSON with this exact shape:
-  
-  {
-    "first_name": string | null,
-    "last_name": string | null,
-    "email": string | null,
-    "location": string | null,
-    "budget_min": number | null,
-    "budget_max": number | null
-  }
-  
-  Rules:
-  - "location" can be a city, neighborhood, or area name (e.g. "Arlington, VA" or "Manassas").
-  - If buyer mentions budget like "around 500k" or "400 to 600 thousand", convert to budget_min / budget_max in dollars.
-  - If only one budget number is mentioned, set both budget_min and budget_max to that number.
-  - Do not include any text outside the JSON object.
-  - Use numbers for budget values, no currency symbols.
-  
-  Call summary:
-  ${summary || "(none)"}
-  
-  Transcript:
-  ${transcript || "(none)"}
-  `.trim();
-  
-    try {
-      const resp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content:
-              "You extract structured data for a real estate CRM. Respond with ONLY a single JSON object, valid JSON.",
-          },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-        temperature: 0,
-      });
-  
-      const content = resp.choices[0]?.message?.content;
-      if (!content) {
-        console.error("No content from LLM enrichment");
-        return null;
-      }
-  
-      let parsed: any;
-      try {
-        parsed = JSON.parse(content);
-      } catch (err) {
-        console.error("Failed to parse LLM JSON:", err, "raw:", content);
-        return null;
-      }
-  
-      const result: LLMExtractionResult = {
-        first_name: parsed.first_name ?? null,
-        last_name: parsed.last_name ?? null,
-        email: parsed.email ?? null,
-        location: parsed.location ?? null,
-        budget_min:
-          typeof parsed.budget_min === "number" ? parsed.budget_min : null,
-        budget_max:
-          typeof parsed.budget_max === "number" ? parsed.budget_max : null,
-      };
-  
-      return result;
-    } catch (err) {
-      console.error("LLM enrichment error:", err);
-      return null;
-    }
-  }
+// ---------- generic JSON normalizer (fallback) ----------
 
-// ---------- Handlers ----------
+function normalizeGenericLeadPayload(body: any): NormalizedLead {
+  const lead = body.lead ?? body;
+  const summary = lead.summary ?? {};
+  const meta = lead.meta ?? {};
+
+  return {
+    agent_id: lead.agent_id ?? meta.agent_id ?? null,
+    first_name: lead.first_name ?? summary.first_name ?? null,
+    last_name: lead.last_name ?? summary.last_name ?? null,
+    phone: lead.phone ?? lead.caller_number ?? null,
+    email: lead.email ?? summary.email ?? null,
+    source: lead.source ?? "AI Phone Call",
+    priority_score: lead.priority_score ?? null,
+    intent_score: lead.intent_score ?? null,
+    buyer_seller: lead.buyer_seller ?? null,
+    timeline: lead.timeline ?? null,
+    status: lead.status ?? "new",
+    intent: lead.intent ?? summary.intent ?? null,
+    urgency: lead.urgency ?? summary.urgency ?? null,
+    priority: lead.priority ?? null,
+    ai_notes: lead.ai_notes ?? summary.notes ?? null,
+  };
+}
+
+function normalizeLeadPayload(body: any): NormalizedLead {
+  // Retell webhook
+  if (body && body.event === "call_analyzed" && body.call) {
+    return normalizeRetellCallAnalyzed(body);
+  }
+  // generic / test payloads
+  return normalizeGenericLeadPayload(body);
+}
+
+// ---------- routes ----------
 
 export async function GET() {
   return NextResponse.json({ status: "ok", method: "GET" });
@@ -343,7 +214,7 @@ export async function GET() {
 
 export async function POST(req: Request) {
   try {
-    // Soft auth: only block if a *wrong* secret is provided.
+    // TEMP: only block if header is present AND wrong
     const header = req.headers.get("x-intake-secret");
     if (header && INTAKE_SECRET && header !== INTAKE_SECRET) {
       console.warn("Intake request with wrong secret");
@@ -353,11 +224,9 @@ export async function POST(req: Request) {
     const body = await req.json();
     console.log("📞 Incoming phone call payload:", body);
 
-    // For now we assume Retell-style payloads
-    const norm = normalizeRetellPayload(body);
+    const norm = normalizeLeadPayload(body);
     const nowIso = new Date().toISOString();
 
-    // 1) Insert initial lead
     const { data, error } = await supabaseServer
       .from("leads")
       .insert({
@@ -389,54 +258,12 @@ export async function POST(req: Request) {
       .select()
       .maybeSingle();
 
-    if (error || !data) {
+    if (error) {
       console.error("❌ Error inserting lead:", error);
       return NextResponse.json(
-        { error: "Failed to save lead", details: error?.message },
+        { error: "Failed to save lead", details: error.message },
         { status: 500 }
       );
-    }
-
-    // 2) LLM enrichment (name, email, location, budget)
-    try {
-      const enrichment = await enrichLeadWithLLM({
-        summary: norm.intent ?? "",
-        transcript: body.call?.transcript ?? "",
-      });
-
-      if (enrichment) {
-        const updatePayload: any = {
-          llm_raw: enrichment,
-        };
-
-        // Only overwrite if LLM found something
-        if (enrichment.first_name || enrichment.last_name) {
-          updatePayload.first_name =
-            enrichment.first_name ?? data.first_name ?? null;
-          updatePayload.last_name =
-            enrichment.last_name ?? data.last_name ?? null;
-        }
-        if (enrichment.email) {
-          updatePayload.email = enrichment.email;
-        }
-        if (enrichment.location) {
-          updatePayload.location = enrichment.location;
-        }
-        if (enrichment.budget_min !== null) {
-          updatePayload.budget_min = enrichment.budget_min;
-        }
-        if (enrichment.budget_max !== null) {
-          updatePayload.budget_max = enrichment.budget_max;
-        }
-
-        await supabaseServer
-          .from("leads")
-          .update(updatePayload)
-          .eq("id", data.id);
-      }
-    } catch (e) {
-      console.error("LLM enrichment failed:", e);
-      // don't block webhook on enrichment failure
     }
 
     return NextResponse.json({ status: "ok", lead: data });
