@@ -1,7 +1,17 @@
+// app/api/intake/phone-call/route.ts
+
 import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
+import OpenAI from "openai";
 
 const INTAKE_SECRET = process.env.INTAKE_SECRET;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+const openai = OPENAI_API_KEY
+  ? new OpenAI({ apiKey: OPENAI_API_KEY })
+  : null;
+
+// ---------- Types ----------
 
 type NormalizedLead = {
   agent_id: string | null;
@@ -13,52 +23,66 @@ type NormalizedLead = {
   priority_score: number | null;
   intent_score: number | null;
   buyer_seller: string | null; // "buyer" | "seller" | null
-  timeline: string | null;     // "asap", "0-3 months", etc.
+  timeline: string | null; // "asap", "0-3 months", etc.
   status: string;
   intent: string | null;
-  urgency: string | null;      // "high" | "medium" | "low" | null
+  urgency: string | null; // "high" | "medium" | "low" | null
   priority: string | null;
   ai_notes: string | null;
 };
 
-// ---- Heuristics helpers -------------------------------------
+type LLMExtractionResult = {
+  first_name: string | null;
+  last_name: string | null;
+  email: string | null;
+  location: string | null;
+  budget_min: number | null;
+  budget_max: number | null;
+};
+
+// ---------- Heuristic helpers (buyer/seller, timeline, scoring) ----------
 
 function extractBuyerSeller(text: string): string | null {
-    const lower = text.toLowerCase();
-  
-    const hasPropertyWord = /(house|home|property|condo|apartment|place|townhome|townhouse)/.test(
+  const lower = text.toLowerCase();
+
+  const hasPropertyWord =
+    /(house|home|property|condo|apartment|place|townhome|townhouse)/.test(
       lower
     );
-  
-    // Buyer intent
-    if (
-      hasPropertyWord &&
-      /(buy|purchase|looking to buy|looking to purchase|shopping for|interested in buying)/.test(
-        lower
-      )
-    ) {
-      return "buyer";
-    }
-  
-    // Seller intent
-    if (
-      hasPropertyWord &&
-      /(sell|selling|list|listing|get it listed|put.*on the market|put my .* on the market)/.test(
-        lower
-      )
-    ) {
-      return "seller";
-    }
-  
-    return null;
+
+  // Buyer intent
+  if (
+    hasPropertyWord &&
+    /(buy|purchase|looking to buy|looking to purchase|shopping for|interested in buying)/.test(
+      lower
+    )
+  ) {
+    return "buyer";
   }
 
-function extractTimeline(text: string): { timeline: string | null; urgency: string | null } {
+  // Seller intent
+  if (
+    hasPropertyWord &&
+    /(sell|selling|list|listing|get it listed|put.*on the market|put my .* on the market)/.test(
+      lower
+    )
+  ) {
+    return "seller";
+  }
+
+  return null;
+}
+
+function extractTimeline(
+  text: string
+): { timeline: string | null; urgency: string | null } {
   const lower = text.toLowerCase();
 
   // ASAP / very soon
   if (
-    /asap|as soon as possible|right away|immediately|this week|next week/.test(lower)
+    /asap|as soon as possible|right away|immediately|this week|next week/.test(
+      lower
+    )
   ) {
     return { timeline: "ASAP", urgency: "high" };
   }
@@ -131,7 +155,11 @@ function scoreLead(opts: {
   }
 
   // Clear buying intent phrases
-  if (/buy a house|buy a home|purchase a house|purchase a home|ready to move/i.test(opts.text)) {
+  if (
+    /buy a house|buy a home|purchase a house|purchase a home|ready to move/i.test(
+      opts.text
+    )
+  ) {
     intent += 10;
   }
 
@@ -155,7 +183,7 @@ function scoreLead(opts: {
   return { priority_score: priority, intent_score: intent, urgency };
 }
 
-// ---- Normalizer for Retell payload --------------------------
+// ---------- Retell normalizer ----------
 
 function normalizeRetellPayload(body: any): NormalizedLead {
   const call = body.call ?? {};
@@ -179,7 +207,6 @@ function normalizeRetellPayload(body: any): NormalizedLead {
     null;
 
   const transcript: string = call.transcript ?? "";
-
   const combinedText = `${callSummary ?? ""}\n${transcript}`;
 
   const buyer_seller = extractBuyerSeller(combinedText);
@@ -200,7 +227,7 @@ function normalizeRetellPayload(body: any): NormalizedLead {
 
   return {
     agent_id: call.agent_id ?? null,
-    first_name: null, // we’ll add name extraction later
+    first_name: null, // will be filled by LLM later if possible
     last_name: null,
     phone: call.from_number ?? null,
     email: null,
@@ -217,7 +244,100 @@ function normalizeRetellPayload(body: any): NormalizedLead {
   };
 }
 
-// ---- Handlers -----------------------------------------------
+// ---------- LLM enrichment ----------
+
+async function enrichLeadWithLLM(params: {
+  summary: string;
+  transcript: string;
+}): Promise<LLMExtractionResult | null> {
+  if (!openai) {
+    console.warn("OPENAI_API_KEY not configured, skipping enrichment");
+    return null;
+  }
+
+  const { summary, transcript } = params;
+
+  const prompt = `
+You are a data extraction engine for a real estate CRM.
+Given a call summary and transcript, extract the following fields if present.
+If a field is unknown, set it to null.
+
+Return ONLY valid JSON with this exact shape:
+
+{
+  "first_name": string | null,
+  "last_name": string | null,
+  "email": string | null,
+  "location": string | null,
+  "budget_min": number | null,
+  "budget_max": number | null
+}
+
+Rules:
+- "location" can be a city, neighborhood, or area name (e.g. "Arlington, VA" or "Manassas").
+- If buyer mentions budget like "around 500k" or "400 to 600 thousand", convert to budget_min / budget_max in dollars.
+- If only one budget number is mentioned, set both budget_min and budget_max to that number.
+- Do not include any text outside the JSON object.
+- Use numbers for budget values, no currency symbols.
+
+Call summary:
+${summary || "(none)"}
+
+Transcript:
+${transcript || "(none)"}
+`.trim();
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You extract structured data for a real estate CRM. Respond with ONLY a single JSON object, no commentary.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      temperature: 0,
+    });
+
+    const content = resp.choices[0]?.message?.content;
+    if (!content) {
+      console.error("No content from LLM enrichment");
+      return null;
+    }
+
+    // content should be JSON
+    let parsed: any;
+    try {
+      parsed = JSON.parse(content);
+    } catch (err) {
+      console.error("Failed to parse LLM JSON:", err, "raw:", content);
+      return null;
+    }
+
+    const result: LLMExtractionResult = {
+      first_name: parsed.first_name ?? null,
+      last_name: parsed.last_name ?? null,
+      email: parsed.email ?? null,
+      location: parsed.location ?? null,
+      budget_min:
+        typeof parsed.budget_min === "number" ? parsed.budget_min : null,
+      budget_max:
+        typeof parsed.budget_max === "number" ? parsed.budget_max : null,
+    };
+
+    return result;
+  } catch (err) {
+    console.error("LLM enrichment error:", err);
+    return null;
+  }
+}
+
+// ---------- Handlers ----------
 
 export async function GET() {
   return NextResponse.json({ status: "ok", method: "GET" });
@@ -235,10 +355,11 @@ export async function POST(req: Request) {
     const body = await req.json();
     console.log("📞 Incoming phone call payload:", body);
 
-    // Right now we only handle Retell-style payloads.
+    // For now we assume Retell-style payloads
     const norm = normalizeRetellPayload(body);
     const nowIso = new Date().toISOString();
 
+    // 1) Insert initial lead
     const { data, error } = await supabaseServer
       .from("leads")
       .insert({
@@ -270,12 +391,54 @@ export async function POST(req: Request) {
       .select()
       .maybeSingle();
 
-    if (error) {
+    if (error || !data) {
       console.error("❌ Error inserting lead:", error);
       return NextResponse.json(
-        { error: "Failed to save lead", details: error.message },
+        { error: "Failed to save lead", details: error?.message },
         { status: 500 }
       );
+    }
+
+    // 2) LLM enrichment (name, email, location, budget)
+    try {
+      const enrichment = await enrichLeadWithLLM({
+        summary: norm.intent ?? "",
+        transcript: body.call?.transcript ?? "",
+      });
+
+      if (enrichment) {
+        const updatePayload: any = {
+          llm_raw: enrichment,
+        };
+
+        // Only overwrite if LLM found something
+        if (enrichment.first_name || enrichment.last_name) {
+          updatePayload.first_name =
+            enrichment.first_name ?? data.first_name ?? null;
+          updatePayload.last_name =
+            enrichment.last_name ?? data.last_name ?? null;
+        }
+        if (enrichment.email) {
+          updatePayload.email = enrichment.email;
+        }
+        if (enrichment.location) {
+          updatePayload.location = enrichment.location;
+        }
+        if (enrichment.budget_min !== null) {
+          updatePayload.budget_min = enrichment.budget_min;
+        }
+        if (enrichment.budget_max !== null) {
+          updatePayload.budget_max = enrichment.budget_max;
+        }
+
+        await supabaseServer
+          .from("leads")
+          .update(updatePayload)
+          .eq("id", data.id);
+      }
+    } catch (e) {
+      console.error("LLM enrichment failed:", e);
+      // don't block webhook on enrichment failure
     }
 
     return NextResponse.json({ status: "ok", lead: data });
