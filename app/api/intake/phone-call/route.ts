@@ -3,28 +3,102 @@ import { supabaseServer } from "@/lib/supabaseServer";
 
 const INTAKE_SECRET = process.env.INTAKE_SECRET;
 
-// Very simple normalizer for now.
-function normalizeLeadPayload(body: any) {
-  const lead = body.lead ?? body;
-  const summary = lead.summary ?? {};
-  const meta = lead.meta ?? {};
+type NormalizedLead = {
+  agent_id: string | null;
+  first_name: string | null;
+  last_name: string | null;
+  phone: string | null;
+  email: string | null;
+  source: string;
+  priority_score: number | null;
+  intent_score: number | null;
+  buyer_seller: string | null;
+  timeline: string | null;
+  status: string;
+  intent: string | null;
+  urgency: string | null;
+  priority: string | null;
+  ai_notes: string | null;
+};
+
+function normalizeRetellPayload(body: any): NormalizedLead {
+  const call = body.call ?? {};
+  const analysis = call.call_analysis ?? {};
+  const summaryJsonRaw =
+    analysis.custom_analysis_data?.summary_json ?? null;
+
+  let summaryJson: any = {};
+  if (summaryJsonRaw && typeof summaryJsonRaw === "string") {
+    try {
+      summaryJson = JSON.parse(summaryJsonRaw);
+    } catch (e) {
+      console.error("Failed to parse summary_json:", e);
+    }
+  }
+
+  const callSummary: string | null =
+    summaryJson.call_summary ??
+    analysis.call_summary ??
+    call.transcript ??
+    null;
+
+  const transcript: string = call.transcript ?? "";
+
+  // Simple buyer/seller heuristic
+  const textForIntent = (callSummary ?? "") + " " + transcript;
+  let buyerSeller: string | null = null;
+  if (/buy|purchase|looking to purchase|looking to buy/i.test(textForIntent)) {
+    buyerSeller = "buyer";
+  } else if (/sell|listing|list my home|sell my house/i.test(textForIntent)) {
+    buyerSeller = "seller";
+  }
+
+  // Basic scoring heuristics
+  const userSentiment: string | null =
+    summaryJson.user_sentiment ?? analysis.user_sentiment ?? null;
+  const callSuccessful: boolean =
+    summaryJson.call_successful ?? analysis.call_successful ?? false;
+
+  let priorityScore = 40;
+  let intentScore = 50;
+  let urgency: string | null = "medium";
+
+  // Boost if successful and clear intent
+  if (callSuccessful) {
+    priorityScore += 30;
+    intentScore += 20;
+  }
+
+  if (/purchase a house|buy a house|buy a home/i.test(textForIntent)) {
+    intentScore += 10;
+  }
+
+  if (userSentiment === "Positive") {
+    priorityScore += 10;
+  } else if (userSentiment === "Negative") {
+    priorityScore -= 10;
+  }
+
+  // Clamp scores
+  priorityScore = Math.max(0, Math.min(100, priorityScore));
+  intentScore = Math.max(0, Math.min(100, intentScore));
 
   return {
-    agent_id: lead.agent_id ?? meta.agent_id ?? null,
-    first_name: lead.first_name ?? summary.first_name ?? null,
-    last_name: lead.last_name ?? summary.last_name ?? null,
-    phone: lead.phone ?? lead.caller_number ?? null,
-    email: lead.email ?? summary.email ?? null,
-    source: lead.source ?? "AI Phone Call",
-    priority_score: lead.priority_score ?? null,
-    intent_score: lead.intent_score ?? null,
-    buyer_seller: lead.buyer_seller ?? null,
-    timeline: lead.timeline ?? null,
-    status: lead.status ?? "new",
-    intent: lead.intent ?? summary.intent ?? null,
-    urgency: lead.urgency ?? summary.urgency ?? null,
-    priority: lead.priority ?? null,
-    ai_notes: lead.ai_notes ?? summary.notes ?? null,
+    agent_id: call.agent_id ?? null,
+    first_name: null, // not captured yet in this call
+    last_name: null,
+    phone: call.from_number ?? null, // caller = lead phone
+    email: null, // not provided in this example
+    source: "AI Phone Call",
+    priority_score: priorityScore,
+    intent_score: intentScore,
+    buyer_seller: buyerSeller,
+    timeline: null, // no timeframe mentioned in this call
+    status: "new",
+    intent: callSummary,
+    urgency,
+    priority: null,
+    ai_notes: callSummary,
   };
 }
 
@@ -34,7 +108,7 @@ export async function GET() {
 
 export async function POST(req: Request) {
   try {
-    // 🔓 TEMPORARY: only block if someone sends a *wrong* secret.
+    // TEMP: only block if someone sends a wrong secret.
     // If there is no header, we let it through (for Retell).
     const header = req.headers.get("x-intake-secret");
     if (header && INTAKE_SECRET && header !== INTAKE_SECRET) {
@@ -45,7 +119,7 @@ export async function POST(req: Request) {
     const body = await req.json();
     console.log("📞 Incoming phone call payload:", body);
 
-    const norm = normalizeLeadPayload(body);
+    const norm = normalizeRetellPayload(body);
     const nowIso = new Date().toISOString();
 
     const { data, error } = await supabaseServer
