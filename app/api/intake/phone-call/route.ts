@@ -1,16 +1,7 @@
-// app/api/intake/phone-call/route.ts
-
 import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 
 const INTAKE_SECRET = process.env.INTAKE_SECRET;
-
-// ---------- Types ----------
-
-type RetellWebhookBody = {
-  event: string;
-  call?: any;
-};
 
 type NormalizedLead = {
   agent_id: string | null;
@@ -21,23 +12,158 @@ type NormalizedLead = {
   source: string;
   priority_score: number | null;
   intent_score: number | null;
-  buyer_seller: string | null;
-  timeline: string | null;
+  buyer_seller: string | null; // "buyer" | "seller" | null
+  timeline: string | null;     // "asap", "0-3 months", etc.
   status: string;
   intent: string | null;
-  urgency: string | null;
+  urgency: string | null;      // "high" | "medium" | "low" | null
   priority: string | null;
   ai_notes: string | null;
 };
 
-// ---------- Normalizer (Retell → Lead) ----------
+// ---- Heuristics helpers -------------------------------------
 
-function normalizeRetellPayload(body: RetellWebhookBody): NormalizedLead {
+function extractBuyerSeller(text: string): string | null {
+  const lower = text.toLowerCase();
+
+  const buyerPatterns = [
+    "buy a house",
+    "buy a home",
+    "buying a house",
+    "buying a home",
+    "looking to buy",
+    "looking to purchase",
+    "purchase a house",
+    "purchase a home",
+    "buyer consultation",
+  ];
+
+  const sellerPatterns = [
+    "sell my house",
+    "sell my home",
+    "selling my house",
+    "selling my home",
+    "list my home",
+    "listing appointment",
+    "home value",
+    "what is my house worth",
+  ];
+
+  if (buyerPatterns.some((p) => lower.includes(p))) return "buyer";
+  if (sellerPatterns.some((p) => lower.includes(p))) return "seller";
+
+  return null;
+}
+
+function extractTimeline(text: string): { timeline: string | null; urgency: string | null } {
+  const lower = text.toLowerCase();
+
+  // ASAP / very soon
+  if (
+    /asap|as soon as possible|right away|immediately|this week|next week/.test(lower)
+  ) {
+    return { timeline: "ASAP", urgency: "high" };
+  }
+
+  // This month / next couple of months
+  if (
+    /this month|next month|within a couple of months|within a few months|in the next few months/.test(
+      lower
+    )
+  ) {
+    return { timeline: "0-3 months", urgency: "high" };
+  }
+
+  // 3-6 months window
+  if (
+    /in 3 months|in three months|in 4 months|in four months|in 5 months|in five months|in 6 months|in six months|this summer|this fall|later this year/.test(
+      lower
+    )
+  ) {
+    return { timeline: "3-6 months", urgency: "medium" };
+  }
+
+  // 6-12 months / next year
+  if (
+    /next year|in a year|in 9 months|in nine months|in 10 months|in ten months|in 11 months|in eleven months/.test(
+      lower
+    )
+  ) {
+    return { timeline: "6-12 months", urgency: "low" };
+  }
+
+  // Default
+  return { timeline: null, urgency: "medium" };
+}
+
+function scoreLead(opts: {
+  buyer_seller: string | null;
+  timeline: string | null;
+  userSentiment: string | null;
+  callSuccessful: boolean;
+  text: string;
+}): { priority_score: number; intent_score: number; urgency: string | null } {
+  let priority = 40;
+  let intent = 50;
+
+  // Base urgency from timeline
+  let urgency: string | null = "medium";
+  if (opts.timeline === "ASAP" || opts.timeline === "0-3 months") urgency = "high";
+  if (opts.timeline === "6-12 months") urgency = "low";
+
+  // Buyer / seller identified = stronger intent
+  if (opts.buyer_seller) {
+    intent += 15;
+    priority += 10;
+  }
+
+  // Timeframe closer → higher scores
+  if (opts.timeline === "ASAP") {
+    priority += 25;
+    intent += 20;
+  } else if (opts.timeline === "0-3 months") {
+    priority += 15;
+    intent += 15;
+  } else if (opts.timeline === "3-6 months") {
+    priority += 8;
+    intent += 10;
+  } else if (opts.timeline === "6-12 months") {
+    priority -= 5;
+    intent -= 5;
+  }
+
+  // Clear buying intent phrases
+  if (/buy a house|buy a home|purchase a house|purchase a home|ready to move/i.test(opts.text)) {
+    intent += 10;
+  }
+
+  // Sentiment
+  if (opts.userSentiment === "Positive") {
+    priority += 10;
+  } else if (opts.userSentiment === "Negative") {
+    priority -= 10;
+  }
+
+  // Call considered successful by Retell
+  if (opts.callSuccessful) {
+    priority += 10;
+    intent += 10;
+  }
+
+  // Clamp 0-100
+  priority = Math.max(0, Math.min(100, priority));
+  intent = Math.max(0, Math.min(100, intent));
+
+  return { priority_score: priority, intent_score: intent, urgency };
+}
+
+// ---- Normalizer for Retell payload --------------------------
+
+function normalizeRetellPayload(body: any): NormalizedLead {
   const call = body.call ?? {};
   const analysis = call.call_analysis ?? {};
-
-  // Retell custom JSON summary (if configured)
-  const summaryJsonRaw = analysis.custom_analysis_data?.summary_json ?? null;
+  const summaryJsonRaw =
+    analysis.custom_analysis_data?.summary_json ?? null;
 
   let summaryJson: any = {};
   if (summaryJsonRaw && typeof summaryJsonRaw === "string") {
@@ -56,72 +182,44 @@ function normalizeRetellPayload(body: RetellWebhookBody): NormalizedLead {
 
   const transcript: string = call.transcript ?? "";
 
-  // ---------- Buyer / Seller heuristic ----------
-  const textForIntent = (callSummary ?? "") + " " + transcript;
-  let buyerSeller: string | null = null;
+  const combinedText = `${callSummary ?? ""}\n${transcript}`;
 
-  if (
-    /buy|purchase|looking to purchase|looking to buy|buyer/i.test(textForIntent)
-  ) {
-    buyerSeller = "buyer";
-  } else if (
-    /sell|listing|list my home|sell my house|seller/i.test(textForIntent)
-  ) {
-    buyerSeller = "seller";
-  }
+  const buyer_seller = extractBuyerSeller(combinedText);
+  const { timeline, urgency: timelineUrgency } = extractTimeline(combinedText);
 
-  // ---------- Scoring heuristics ----------
   const userSentiment: string | null =
     summaryJson.user_sentiment ?? analysis.user_sentiment ?? null;
   const callSuccessful: boolean =
     summaryJson.call_successful ?? analysis.call_successful ?? false;
 
-  let priorityScore = 40;
-  let intentScore = 50;
-  let urgency: string | null = "medium";
-
-  // If Retell said the call was "successful", boost scores
-  if (callSuccessful) {
-    priorityScore += 30;
-    intentScore += 20;
-  }
-
-  // Clear purchase intent
-  if (/purchase a house|buy a house|buy a home/i.test(textForIntent)) {
-    intentScore += 10;
-  }
-
-  // Sentiment weighting
-  if (userSentiment === "Positive") {
-    priorityScore += 10;
-  } else if (userSentiment === "Negative") {
-    priorityScore -= 10;
-  }
-
-  // Clamp scores 0–100
-  priorityScore = Math.max(0, Math.min(100, priorityScore));
-  intentScore = Math.max(0, Math.min(100, intentScore));
+  const { priority_score, intent_score, urgency } = scoreLead({
+    buyer_seller,
+    timeline,
+    userSentiment,
+    callSuccessful,
+    text: combinedText,
+  });
 
   return {
     agent_id: call.agent_id ?? null,
-    first_name: null, // name capture not wired yet
+    first_name: null, // we’ll add name extraction later
     last_name: null,
-    phone: call.from_number ?? null, // inbound caller
-    email: null, // no email in this payload yet
+    phone: call.from_number ?? null,
+    email: null,
     source: "AI Phone Call",
-    priority_score: priorityScore,
-    intent_score: intentScore,
-    buyer_seller: buyerSeller,
-    timeline: null, // timeframe not extracted yet
+    priority_score,
+    intent_score,
+    buyer_seller,
+    timeline,
     status: "new",
     intent: callSummary,
-    urgency,
+    urgency: urgency ?? timelineUrgency,
     priority: null,
     ai_notes: callSummary,
   };
 }
 
-// ---------- Handlers ----------
+// ---- Handlers -----------------------------------------------
 
 export async function GET() {
   return NextResponse.json({ status: "ok", method: "GET" });
@@ -129,26 +227,17 @@ export async function GET() {
 
 export async function POST(req: Request) {
   try {
-    // If a header is sent AND a secret is configured, enforce it.
-    // If no header is present, let it through (Retell can't set headers easily).
+    // Soft auth: only block if a *wrong* secret is provided.
     const header = req.headers.get("x-intake-secret");
     if (header && INTAKE_SECRET && header !== INTAKE_SECRET) {
       console.warn("Intake request with wrong secret");
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const body = (await req.json()) as RetellWebhookBody;
+    const body = await req.json();
     console.log("📞 Incoming phone call payload:", body);
 
-    // We only want to create leads on the final analyzed event.
-    if (body.event !== "call_analyzed") {
-      console.log("Ignoring non-analyzed event:", body.event);
-      return NextResponse.json({
-        status: "ignored",
-        event: body.event,
-      });
-    }
-
+    // Right now we only handle Retell-style payloads.
     const norm = normalizeRetellPayload(body);
     const nowIso = new Date().toISOString();
 
@@ -176,7 +265,7 @@ export async function POST(req: Request) {
             type: "created",
             at: nowIso,
             source: norm.source,
-            raw: body, // full Retell payload for debugging
+            raw: body,
           },
         ],
       })
